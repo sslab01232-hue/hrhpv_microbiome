@@ -1,172 +1,139 @@
-# Co-occurrence networks (NetCoMi 1.3.0) and sensitivity analyses
-library(NetCoMi)
-library(igraph)
-library(parallel)
+# Diversity: regression models, PERMANOVA robustness, covariate adjustment,
+# three-group comparison, and exclusion of HPV52-positive or SCC cases.
+# Run after 03_diversity.R.
+library(vegan)
+library(dplyr)
+library(ecodist)
 source("config.R")
-source("05_network_functions.R")
 
-out <- out_dir("network")
-md  <- read_metadata()
+out  <- out_dir("diversity", "sensitivity")
+prim <- out_dir("diversity")
+meta <- read_metadata()
+meta$Group3 <- factor(ifelse(meta$Group == "single", "single",
+                             ifelse(meta$n_major_hrHPV >= 2, "multiple-2", "multiple-1")),
+                      levels = c("single", "multiple-1", "multiple-2"))
 
-# Read counts of the 20 most abundant species ---------------------------------
-asv  <- read.csv(data_path("asv_table_1288.csv"), check.names = FALSE)
-sp20 <- read.csv(data_path("network_species.csv"))$Taxa
-in20 <- asv$Species %in% sp20
-counts   <- rowsum(as.matrix(asv[in20, md$SampleID]), asv$Species[in20])[sp20, ]
-single   <- t(counts[, md$Group == "single"])
-multiple <- t(counts[, md$Group == "multiple"])
+# QIIME 2 core-metrics output (40,000 reads)
+cm <- function(...) file.path(data_path("core_metrics"), ...)
+idx <- c(Observed = "observed_features", FaithPD = "faith_pd", Shannon = "shannon", Evenness = "evenness")
+alpha <- cbind(meta, sapply(idx, function(n)
+  read.delim(cm(paste0(n, "_vector"), "alpha-diversity.tsv"), row.names = 1)[meta$SampleID, 1]))
+read_dm <- function(n) as.dist(as.matrix(read.delim(cm(paste0(n, "_distance_matrix"), "distance-matrix.tsv"),
+                                                    row.names = 1, check.names = FALSE)))
+dms <- list("Unweighted UniFrac" = read_dm("unweighted_unifrac"), "Jaccard" = read_dm("jaccard"))
+meta_of <- function(d) meta[labels(d), ]
 
-# Primary networks --------------------------------------------------------------
-set.seed(seed)
-net <- netConstruct(data = single, data2 = multiple, dataType = "counts", measure = "sparcc",
-                    zeroMethod = "none", normMethod = "none", sparsMethod = "threshold", thresh = 0.3,
-                    dissFunc = "signed", seed = seed)
-ana <- netAnalyze(net, centrLCC = TRUE, clustMethod = "cluster_fast_greedy", hubPar = "eigenvector",
-                  weightDeg = FALSE, normDeg = TRUE)
-cmp <- netCompare(ana, permTest = TRUE, nPerm = 1000, adjust = "BH", testRand = TRUE, nPermRand = 1000,
-                  gcd = TRUE, seed = seed, returnPermProps = TRUE, returnPermCentr = TRUE)
-saveRDS(list(net = net, ana = ana, cmp = cmp), file.path(out, "netcomi.rds"))
-groups <- c("Single hrHPV", "Multiple hrHPV")
-writeLines(capture.output(summary(cmp, groupNames = groups, numbNodes = 20,
-                                  showCentr = c("degree", "betweenness", "closeness", "eigenvector"))),
-           file.path(out, "netCompare_summary.txt"))
+wilcox_tab <- function(d) data.frame(Index = names(idx), P = sapply(names(idx), function(v)
+  suppressWarnings(wilcox.test(d[[v]] ~ d$Group))$p.value))
 
-# edge lists
-edge_list <- function(a, adj) {
-  ut <- which(upper.tri(adj) & adj != 0, arr.ind = TRUE)
-  data.frame(taxon1 = rownames(a)[ut[, 1]], taxon2 = colnames(a)[ut[, 2]], sparcc = a[ut])
+# Alpha diversity ------------------------------------------------------------
+w <- wilcox_tab(alpha); w$q <- p.adjust(w$P, "BH")
+write.csv(w, file.path(out, "alpha_wilcoxon.csv"), row.names = FALSE)
+write.csv(data.frame(Index = names(idx), P = sapply(names(idx), function(v) kruskal.test(alpha[[v]] ~ alpha$Group3)$p.value)),
+          file.path(out, "alpha_kruskal_3groups.csv"), row.names = FALSE)
+
+# regression: quasi-Poisson for observed features (IRR), linear for the others
+alpha_reg <- function(d, rhs, label) {
+  do.call(rbind, lapply(names(idx), function(v) {
+    f <- reformulate(rhs, v)
+    m <- if (v == "Observed") glm(f, quasipoisson, d) else lm(f, d)
+    co <- summary(m)$coefficients[-1, , drop = FALSE]
+    ci <- suppressMessages(confint(m))[rownames(co), , drop = FALSE]
+    est <- cbind(co[, 1], ci)
+    if (v == "Observed") est <- exp(est)
+    data.frame(Index = v, Model = label, Term = rownames(co), Estimate = est[, 1],
+               CI_low = est[, 2], CI_high = est[, 3], P = co[, 4], row.names = NULL)
+  }))
 }
-write.csv(edge_list(net$assoMat1, net$adjaMat1), file.path(out, "edges_single.csv"), row.names = FALSE)
-write.csv(edge_list(net$assoMat2, net$adjaMat2), file.path(out, "edges_multiple.csv"), row.names = FALSE)
+neg52 <- meta$HPV52 == "N"
+reg <- rbind(alpha_reg(alpha, "Group", "Unadjusted"),
+             alpha_reg(alpha, c("Group", "Age"), "Age"),
+             alpha_reg(alpha, c("Group", "HPV52"), "HPV52"),
+             alpha_reg(alpha, c("Group", "Age", "HPV52"), "Age + HPV52"),
+             alpha_reg(alpha[neg52, ], "Group", "HPV52-negative"),
+             alpha_reg(alpha[neg52, ], c("Group", "Age"), "HPV52-negative, age"))
+write.csv(reg, file.path(out, "alpha_regression.csv"), row.names = FALSE)
 
-# Tables from the netCompare summary -------------------------------------------
-txt <- readLines(file.path(out, "netCompare_summary.txt"))
-block <- function(title, n_num, stop = "^\\s*$") {          # rows from a title to the next stop line
-  from <- grep(title, txt)[1] + 1
-  rest <- txt[from:length(txt)]
-  rows <- rest[seq_len(grep(stop, rest)[1] - 1)]
-  rows <- sub("\\s+[.*]+\\s*$", "", rows)                       # drop significance codes
-  m <- regmatches(rows, regexec(paste0("^\\s*(.*?)", strrep("\\s+(\\S+)", n_num), "\\s*$"), rows))
-  m <- do.call(rbind, m[lengths(m) == n_num + 2])
-  v <- suppressWarnings(matrix(as.numeric(m[, -(1:2)]), nrow(m)))
-  data.frame(name = m[, 2], v)[complete.cases(v), ]
-}
-glob <- setNames(block("^Whole network:", 4, stop = "^-{3,}"), c("Property", groups, "Abs_diff", "P"))
-sel  <- glob$Property %in% GLOB
-glob$q <- NA
-glob$q[sel] <- p.adjust(glob$P[sel], "BH")                       # BH across the five reported properties
-write.csv(glob, file.path(out, "global_properties.csv"), row.names = FALSE)
-
-cent <- do.call(rbind, lapply(c("Degree", "Betweenness centrality", "Closeness centrality", "Eigenvector centrality"),
-  function(k) cbind(Centrality = k, setNames(block(paste0("^", k, " \\(normalized\\)"), 5),
-                                             c("Taxon", groups, "Abs_diff", "P", "q")))))
-write.csv(cent, file.path(out, "centralities.csv"), row.names = FALSE)
-i <- grep("^(ARI|GCD) ", txt)
-print(txt[sort(c(i, i + 1))])
-
-# The functions in 05_network_functions.R reproduce the NetCoMi estimates ------
-set.seed(seed); a1 <- sparcc(net$countMat1); a2 <- sparcc(net$countMat2)
-print(c(max(abs(a1 - net$assoEst1[rownames(a1), colnames(a1)])), max(abs(a2 - net$assoEst2[rownames(a2), colnames(a2)]))))
-set.seed(seed); pm <- perm_group_mat(nrow(net$countMat1), nrow(net$countMat2), 1000); ps <- sample.int(1e8, 1000)
-xb <- rbind(net$countMat1, net$countMat2)
-print(sapply(1:5, function(p) {
-  set.seed(ps[p])
-  b1 <- calc_props(build_net(sparcc(xb[pm[p, ] == 1, ]), 0.3))
-  b2 <- calc_props(build_net(sparcc(xb[pm[p, ] == 2, ]), 0.3))
-  max(abs(abs(unlist(b1[names(GLOB)]) - unlist(b2[names(GLOB)])) - cmp$permDiffGlobal[p, 1:5]))
-}))
-
-# Sensitivity analyses ---------------------------------------------------------
-c1 <- net$countMat1; c2 <- net$countMat2; A1 <- net$assoEst1; A2 <- net$assoEst2
-TH <- c(0.2, 0.3, 0.4)
-B  <- 1000
-
-# permutation test (as in netCompare) at one or more thresholds
-perm_compare <- function(x1, x2, th) {
+# Beta diversity: PERMANOVA, 95% subsampling range of R2, PERMDISP, ANOSIM, Mantel, MRM
+# (R2 range: 80% of each group sampled without replacement, 999 times)
+subsample_r2 <- function(d, mdf, rhs) {
+  m <- as.matrix(d)
+  by_grp <- split(seq_len(nrow(mdf)), mdf$Group)
   set.seed(seed)
-  pm <- perm_group_mat(nrow(x1), nrow(x2), B)
-  ps <- sample.int(1e8, B)
-  xb <- rbind(x1, x2)
-  mclapply(seq_len(B), function(p) {
-    set.seed(ps[p])
-    b1 <- sparcc(xb[pm[p, ] == 1, , drop = FALSE])
-    b2 <- sparcc(xb[pm[p, ] == 2, , drop = FALSE])
-    lapply(th, function(t) {
-      p1 <- calc_props(build_net(b1, t)); p2 <- calc_props(build_net(b2, t))
-      list(glob = abs(unlist(p1[names(GLOB)]) - unlist(p2[names(GLOB)])),
-           cent = sapply(names(CENT), function(k) abs(p1[[k]] - p2[[k]])))
-    })
-  }, mc.cores = n_cores)
+  r2 <- vapply(seq_len(999), function(b) {
+    i <- unlist(lapply(by_grp, function(x) sample(x, round(0.8 * length(x)))))
+    f <- as.formula(paste("as.dist(m[i, i]) ~", paste(rhs, collapse = " + ")))
+    a <- tryCatch(adonis2(f, data = mdf[i, , drop = FALSE], permutations = 99, by = "terms"),
+                  error = function(e) NULL)
+    if (is.null(a)) NA_real_ else a["Group", "R2"]
+  }, numeric(1))
+  quantile(r2, c(0.025, 0.975), na.rm = TRUE)
 }
-perm_summary <- function(perm, o1, o2, j, label) {
-  obs <- abs(unlist(o1[names(GLOB)]) - unlist(o2[names(GLOB)]))
-  pg  <- t(sapply(perm, function(x) x[[j]]$glob))
-  p   <- (colSums(sweep(pg, 2, obs, ">=")) + 1) / (B + 1)
-  g <- data.frame(Analysis = label, Property = GLOB, Single = unlist(o1[names(GLOB)]), Multiple = unlist(o2[names(GLOB)]),
-                  P = p, q = p.adjust(p, "BH"), Edges_single = o1$nEdges, Edges_multiple = o2$nEdges)
-  ce <- do.call(rbind, lapply(names(CENT), function(k) {
-    ob <- abs(o1[[k]] - o2[[k]])
-    pc <- t(sapply(perm, function(x) x[[j]]$cent[, k]))
-    pv <- (colSums(sweep(pc, 2, ob, ">=")) + 1) / (B + 1)
-    data.frame(Analysis = label, Centrality = CENT[[k]], Taxon = names(ob), P = pv, q = p.adjust(pv, "BH"))
-  }))
-  list(global = g, centrality = ce)
-}
-
-# correlation thresholds 0.2, 0.3, 0.4
-perm <- perm_compare(c1, c2, TH)
-thr  <- Map(function(t, j) perm_summary(perm, calc_props(build_net(A1, t)), calc_props(build_net(A2, t)), j,
-                                        paste("threshold", t)), TH, seq_along(TH))
-write.csv(do.call(rbind, lapply(thr, `[[`, "global")),     file.path(out, "threshold_global.csv"), row.names = FALSE)
-write.csv(do.call(rbind, lapply(thr, `[[`, "centrality")), file.path(out, "threshold_centrality.csv"), row.names = FALSE)
-
-# bootstrap edge stability (1,000 resamples per group)
-boots <- lapply(1:2, function(g) {
-  cm <- list(c1, c2)[[g]]
-  set.seed(seed + g)
-  idx <- lapply(seq_len(B), function(b) sample(nrow(cm), replace = TRUE))
-  bs  <- sample.int(1e8, B)
-  mclapply(seq_len(B), function(b) { set.seed(bs[b]); sparcc(cm[idx[[b]], , drop = FALSE]) }, mc.cores = n_cores)
-})
-boot <- do.call(rbind, Map(function(g, t) {
-  A  <- list(A1, A2)[[g]]
-  ut <- which(upper.tri(A) & is_edge(A, t), arr.ind = TRUE)
-  kept <- sapply(boots[[g]], function(bm) is_edge(bm[ut], t) & sign(bm[ut]) == sign(A[ut]))
-  data.frame(Group = c("single", "multiple")[g], Threshold = t, Taxon1 = rownames(A)[ut[, 1]],
-             Taxon2 = colnames(A)[ut[, 2]], SparCC = A[ut], Retention = rowMeans(matrix(kept, nrow(ut))))
-}, rep(1:2, each = length(TH)), rep(TH, 2)))
-write.csv(boot, file.path(out, "bootstrap_edge_retention.csv"), row.names = FALSE)
-aggregate(Retention ~ Group + Threshold, boot, function(r) 100 * mean(r >= 0.5))
-
-# single group subsampled to the size of the multiple group (1,000 times)
-set.seed(seed)
-sub_idx <- lapply(seq_len(B), function(b) sort(sample(nrow(c1), nrow(c2))))
-sub_seeds <- sample.int(1e8, B)
-sub <- do.call(rbind, mclapply(seq_len(B), function(b) {
-  set.seed(sub_seeds[b])
-  a <- sparcc(c1[sub_idx[[b]], , drop = FALSE])
-  do.call(rbind, lapply(TH, function(t) {
-    p <- calc_props(build_net(a, t))
-    data.frame(iter = b, Threshold = t, t(unlist(p[names(GLOB)])), nEdges = p$nEdges)
-  }))
-}, mc.cores = n_cores))
-write.csv(sub, file.path(out, "subsample_single_n14.csv"), row.names = FALSE)
-sub_summary <- do.call(rbind, lapply(TH, function(t) {
-  obs <- unlist(calc_props(build_net(A2, t))[c("density", "natConnect", "nEdges")])
-  s <- as.matrix(sub[sub$Threshold == t, c("density", "natConnect", "nEdges")])
-  data.frame(Threshold = t, Metric = names(obs), Multiple = obs,
-             Sub_median = apply(s, 2, median), Sub_q025 = apply(s, 2, quantile, 0.025), Sub_q975 = apply(s, 2, quantile, 0.975),
-             P = (colSums(sweep(s, 2, obs, ">=")) + 1) / (B + 1))
+robust <- do.call(rbind, lapply(names(dms), function(k) {
+  d <- dms[[k]]; mdf <- meta_of(d)
+  design <- dist(as.numeric(mdf$Group) - 1, "manhattan")              # 0 = same group, 1 = different
+  set.seed(seed); ad <- adonis2(d ~ Group, mdf, permutations = n_perm)
+  set.seed(seed); pd <- permutest(betadisper(d, mdf$Group, type = "median"), permutations = n_perm)
+  set.seed(seed); an <- anosim(d, mdf$Group, permutations = n_perm)
+  set.seed(seed); mt <- vegan::mantel(d, design, permutations = n_perm)
+  set.seed(seed); mr <- MRM(d ~ design, nperm = n_perm)
+  r <- subsample_r2(d, mdf, "Group")
+  data.frame(Distance = k, R2 = ad$R2[1], R2_range_low = r[1], R2_range_high = r[2], P = ad$`Pr(>F)`[1],
+             PERMDISP_P = pd$tab$`Pr(>F)`[1], ANOSIM_R = an$statistic, ANOSIM_P = an$signif,
+             Mantel_r = mt$statistic, Mantel_P = mt$signif, MRM_R2 = mr$r.squared[1], MRM_P = mr$r.squared[2])
 }))
-write.csv(sub_summary, file.path(out, "subsample_summary.csv"), row.names = FALSE)
+write.csv(robust, file.path(out, "beta_robustness.csv"), row.names = FALSE)
 
-# HPV52-positive participants excluded
-pos <- md$SampleID[md$HPV52 == "Y"]
-x1  <- c1[!rownames(c1) %in% pos, ]
-x2  <- c2[!rownames(c2) %in% pos, ]
-set.seed(seed); B1 <- sparcc(x1); B2 <- sparcc(x2)
-hpv52 <- perm_summary(perm_compare(x1, x2, 0.3), calc_props(build_net(B1, 0.3)), calc_props(build_net(B2, 0.3)),
-                      1, "HPV52 excluded")
-write.csv(hpv52$global, file.path(out, "HPV52_excluded_global.csv"), row.names = FALSE)
+# PERMANOVA adjusted for age or HPV52 (distance ~ covariate + Group, sequential terms)
+adj <- do.call(rbind, lapply(names(dms), function(k) do.call(rbind, lapply(c("Age", "HPV52"), function(cv) {
+  d <- dms[[k]]; mdf <- meta_of(d)
+  set.seed(seed); a <- adonis2(reformulate(c(cv, "Group"), "d"), mdf, permutations = n_perm, by = "terms")
+  r <- subsample_r2(d, mdf, c(cv, "Group"))
+  data.frame(Distance = k, Covariate = cv, Group_R2 = a["Group", "R2"], R2_range_low = r[1], R2_range_high = r[2],
+             Group_P = a["Group", "Pr(>F)"], Covariate_P = a[cv, "Pr(>F)"])
+}))))
+write.csv(adj, file.path(out, "beta_covariate_adjusted.csv"), row.names = FALSE)
 
-writeLines(capture.output(sessionInfo()), file.path(out, "sessionInfo.txt"))
+# Three groups (unweighted UniFrac) and pairwise distances
+d <- dms[["Unweighted UniFrac"]]; mdf <- meta_of(d)
+set.seed(seed); print(adonis2(d ~ Group3, mdf, permutations = n_perm))
+m <- as.matrix(d); ut <- which(upper.tri(m), arr.ind = TRUE)
+pairs <- data.frame(dist = m[ut], g1 = mdf$Group[ut[, 1]], g2 = mdf$Group[ut[, 2]])
+pairs$cmp <- ifelse(pairs$g1 == pairs$g2, paste(pairs$g1, pairs$g1, sep = "-"), "single-multiple")
+write.csv(aggregate(dist ~ cmp, pairs, function(x) c(median = median(x), quantile(x, c(.25, .75)))),
+          file.path(out, "pairwise_unweighted_unifrac.csv"), row.names = FALSE)
+
+# Joint adjustment and HPV52 exclusion for the five distances (03_diversity.R output)
+dnames <- c("jaccard", "unweighted_unifrac", "braycurtis", "weighted_unifrac", "aitchison")
+joint <- do.call(rbind, lapply(dnames, function(k) {
+  m  <- as.matrix(read.csv(file.path(prim, paste0("primary_dm_", k, ".csv")), row.names = 1, check.names = FALSE))
+  m  <- m[rownames(meta), rownames(meta)]
+  mn <- meta[neg52, ]; dn <- as.dist(m[neg52, neg52])
+  set.seed(seed); a  <- adonis2(as.dist(m) ~ Age + HPV52 + Group, meta, permutations = n_perm, by = "terms")
+  set.seed(seed); a0 <- adonis2(dn ~ Group, mn, permutations = n_perm)
+  set.seed(seed); a1 <- adonis2(dn ~ Age + Group, mn, permutations = n_perm, by = "terms")
+  set.seed(seed); pd <- permutest(betadisper(dn, mn$Group, type = "median"), permutations = n_perm)
+  data.frame(Distance = k,
+             Analysis = c("Age + HPV52", "HPV52-negative", "HPV52-negative, age", "HPV52-negative, PERMDISP"),
+             R2 = c(a["Group", "R2"], a0$R2[1], a1["Group", "R2"], NA),
+             P  = c(a["Group", "Pr(>F)"], a0$`Pr(>F)`[1], a1["Group", "Pr(>F)"], pd$tab$`Pr(>F)`[1]))
+}))
+write.csv(joint, file.path(out, "beta_joint_and_HPV52_excluded.csv"), row.names = FALSE)
+write.csv(wilcox_tab(alpha[neg52, ]), file.path(out, "alpha_wilcoxon_HPV52_excluded.csv"), row.names = FALSE)
+
+# SCC cases excluded (n = 34; PERMANOVA and PERMDISP with 9,999 permutations)
+keep <- meta$SampleID[meta$Dx != "SCC"]
+write.csv(wilcox_tab(alpha[keep, ]), file.path(out, "alpha_wilcoxon_SCC_excluded.csv"), row.names = FALSE)
+k <- meta[keep, ]
+write.csv(data.frame(Test = c("CST", "CST III subtypes", "CST IV subtypes"),
+                     P = c(fisher.test(table(k$Group, k$CST))$p.value,
+                           fisher.test(with(k[k$CST == "III", ], table(Group, CST_subtype)))$p.value,
+                           fisher.test(with(k[k$CST == "IV", ],  table(Group, CST_subtype)))$p.value)),
+          file.path(out, "CST_SCC_excluded.csv"), row.names = FALSE)
+scc <- do.call(rbind, lapply(names(dms), function(nm) {
+  d <- as.dist(as.matrix(dms[[nm]])[keep, keep]); g <- meta[labels(d), "Group"]
+  set.seed(seed); a  <- adonis2(d ~ g, permutations = 9999)
+  set.seed(seed); pd <- permutest(betadisper(d, g, type = "median"), permutations = 9999)
+  data.frame(Distance = nm, R2 = a$R2[1], P = a$`Pr(>F)`[1], PERMDISP_P = pd$tab$`Pr(>F)`[1])
+}))
+write.csv(scc, file.path(out, "beta_SCC_excluded.csv"), row.names = FALSE)
