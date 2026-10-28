@@ -4,8 +4,8 @@ Raw 16S rRNA gene sequencing reads: NCBI SRA BioProject **PRJNA1537372**.
 
 ## Scripts (run in order from the repository root)
 
-| Script | Content | Software |
-|---|---|---|
+| Script | Content |
+|---|---|
 | `01_qiime2_processing.sh` | Trimming, DADA2, ASV filtering, taxonomy, phylogeny, core metrics (QIIME 2 2024.02) |
 | `02_differential_abundance.R` | Taxon-level MaAsLin2 and sensitivity analyses |
 | `03_diversity.R` | Alpha and beta diversity, 100 rarefactions, rare-ASV filters, rarefaction curves |
